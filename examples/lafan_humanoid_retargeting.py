@@ -28,12 +28,13 @@ from retarget_helpers._utils import (
 
 # LaFAN data uses Y-up; pyroki uses Z-up.
 def transform_y_up_to_z_up(joints: onp.ndarray) -> onp.ndarray:
-    """Convert Y-up coordinates to Z-up: [x, y, z] -> [x, z, -y]."""
-    result = onp.empty_like(joints)
-    result[..., 0] = joints[..., 0]
-    result[..., 1] = joints[..., 2]
-    result[..., 2] = -joints[..., 1]
-    return result
+    """Convert Y-up coordinates to Z-up: [x, y, z] -> [x, z, y].
+
+    Y-up: X=right, Y=up, Z=forward
+    Z-up: X=right, Y=forward, Z=up
+    """
+    transform_matrix = onp.array([[1, 0, 0], [0, 0, 1], [0, 1, 0]])
+    return joints @ transform_matrix.T
 
 
 class RetargetingWeights(TypedDict):

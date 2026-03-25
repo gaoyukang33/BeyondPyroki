@@ -3,6 +3,9 @@
 Retarget all LaFAN .npy files in an input directory to the G1 humanoid robot,
 and save results to an output directory with corresponding filenames.
 
+Based on example 12 (fancy retargeting) for better quality:
+includes scale regularization, root smoothness, and self-collision avoidance.
+
 Usage:
     python lafan_humanoid_retargeting.py --input_dir /path/to/lafan --output_dir /path/to/output
 """
@@ -36,11 +39,13 @@ def transform_y_up_to_z_up(joints: onp.ndarray) -> onp.ndarray:
 class RetargetingWeights(TypedDict):
     local_alignment: float
     global_alignment: float
+    root_smoothness: float
 
 
 @jdc.jit
 def solve_retargeting(
     robot: pk.Robot,
+    robot_coll: pk.collision.RobotCollision,
     target_keypoints: jnp.ndarray,
     source_joint_retarget_indices: jnp.ndarray,
     g1_joint_retarget_indices: jnp.ndarray,
@@ -59,6 +64,7 @@ def solve_retargeting(
         ]
     )
 
+    # Variables.
     class SourceJointsScaleVar(
         jaxls.Var[jax.Array], default_factory=lambda: jnp.ones((n_retarget, n_retarget))
     ): ...
@@ -70,6 +76,8 @@ def solve_retargeting(
     var_source_joints_scale = SourceJointsScaleVar(jnp.zeros(timesteps))
     var_offset = OffsetVar(jnp.zeros(timesteps))
 
+    # ---- Cost definitions ----
+
     @jaxls.Cost.factory
     def retargeting_cost(
         var_values: jaxls.VarValues,
@@ -78,6 +86,7 @@ def solve_retargeting(
         var_source_joints_scale: SourceJointsScaleVar,
         keypoints: jnp.ndarray,
     ) -> jax.Array:
+        """Match relative joint positions and angles between source and robot."""
         robot_cfg = var_values[var_robot_cfg]
         T_root_link = jaxlie.SE3(robot.forward_kinematics(cfg=robot_cfg))
         T_world_root = var_values[var_Ts_world_root]
@@ -119,12 +128,25 @@ def solve_retargeting(
         )
 
     @jaxls.Cost.factory
+    def scale_regularization(
+        var_values: jaxls.VarValues,
+        var_source_joints_scale: SourceJointsScaleVar,
+    ) -> jax.Array:
+        """Regularize scale: close to 1, symmetric, non-negative."""
+        scale = var_values[var_source_joints_scale]
+        res_close_to_one = (scale - 1.0).flatten() * 1.0
+        res_symmetric = (scale - scale.T).flatten() * 100.0
+        res_nonneg = jnp.clip(-scale, min=0).flatten() * 100.0
+        return jnp.concatenate([res_close_to_one, res_symmetric, res_nonneg])
+
+    @jaxls.Cost.factory
     def pc_alignment_cost(
         var_values: jaxls.VarValues,
         var_Ts_world_root: jaxls.SE3Var,
         var_robot_cfg: jaxls.Var[jnp.ndarray],
         keypoints: jnp.ndarray,
     ) -> jax.Array:
+        """Align keypoint positions to robot link positions in world frame."""
         T_world_root = var_values[var_Ts_world_root]
         robot_cfg = var_values[var_robot_cfg]
         T_root_link = jaxlie.SE3(robot.forward_kinematics(cfg=robot_cfg))
@@ -133,6 +155,19 @@ def solve_retargeting(
         keypoint_pos = keypoints[source_joint_retarget_indices]
         return (link_pos - keypoint_pos).flatten() * weights["global_alignment"]
 
+    @jaxls.Cost.factory
+    def root_smoothness_cost(
+        var_values: jaxls.VarValues,
+        var_Ts_world_root: jaxls.SE3Var,
+        var_Ts_world_root_prev: jaxls.SE3Var,
+    ) -> jax.Array:
+        """Penalize jittery root pose changes."""
+        return (
+            var_values[var_Ts_world_root].inverse() @ var_values[var_Ts_world_root_prev]
+        ).log().flatten() * weights["root_smoothness"]
+
+    # ---- Assemble costs ----
+
     costs = [
         retargeting_cost(
             var_Ts_world_root,
@@ -140,6 +175,7 @@ def solve_retargeting(
             var_source_joints_scale,
             target_keypoints,
         ),
+        scale_regularization(var_source_joints_scale),
         pk.costs.smoothness_cost(
             robot.joint_var_cls(jnp.arange(1, timesteps)),
             robot.joint_var_cls(jnp.arange(0, timesteps - 1)),
@@ -152,10 +188,21 @@ def solve_retargeting(
             .at[joints_to_move_less]
             .set(2.0)[None],
         ),
+        pk.costs.self_collision_cost(
+            jax.tree.map(lambda x: x[None], robot),
+            jax.tree.map(lambda x: x[None], robot_coll),
+            var_joints,
+            margin=0.05,
+            weight=2.0,
+        ),
         pc_alignment_cost(
             var_Ts_world_root,
             var_joints,
             target_keypoints,
+        ),
+        root_smoothness_cost(
+            jaxls.SE3Var(jnp.arange(1, timesteps)),
+            jaxls.SE3Var(jnp.arange(0, timesteps - 1)),
         ),
         pk.costs.limit_constraint(
             jax.tree.map(lambda x: x[None], robot),
@@ -186,6 +233,7 @@ def retarget_single_file(
     npy_path: Path,
     output_path: Path,
     robot: pk.Robot,
+    robot_coll: pk.collision.RobotCollision,
     lafan_joint_retarget_indices: jnp.ndarray,
     g1_joint_retarget_indices: jnp.ndarray,
     lafan_mask: jnp.ndarray,
@@ -211,6 +259,7 @@ def retarget_single_file(
 
     Ts_world_root, joints = solve_retargeting(
         robot=robot,
+        robot_coll=robot_coll,
         target_keypoints=lafan_keypoints,
         source_joint_retarget_indices=lafan_joint_retarget_indices,
         g1_joint_retarget_indices=g1_joint_retarget_indices,
@@ -218,9 +267,8 @@ def retarget_single_file(
         weights=weights,
     )
 
-    # Save: joints (N, n_dof) and transforms (N, 7) as a dict.
     result = {
-        "joints": onp.array(joints),                    # (N, n_dof)
+        "joints": onp.array(joints),                      # (N, n_dof)
         "transforms": onp.array(Ts_world_root.wxyz_xyz),  # (N, 7) wxyz_xyz
     }
     onp.savez(str(output_path), **result)
@@ -228,22 +276,20 @@ def retarget_single_file(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch LaFAN → G1 retargeting")
+    parser = argparse.ArgumentParser(description="Batch LaFAN -> G1 retargeting")
     parser.add_argument(
         "--input_dir",
         type=str,
         default="/Users/yukanggao/Desktop/code_for_nips/holosoma/src/holosoma_retargeting"
                 "/holosoma_retargeting/demo_data/lafan",
-        help="Directory containing LaFAN .npy files",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         default="/Users/yukanggao/Desktop/code_for_nips/pyroki/examples/retarget_output",
-        help="Directory to save retargeted results",
     )
-    parser.add_argument("--max_frames", type=int, default=0, help="Max frames per file (0 = all)")
-    parser.add_argument("--subsample", type=int, default=1, help="Take every N-th frame")
+    parser.add_argument("--max_frames", type=int, default=500, help="Max frames per file (0 = all)")
+    parser.add_argument("--subsample", type=int, default=4, help="Take every N-th frame (default 4: 30fps->7.5fps)")
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
@@ -257,10 +303,12 @@ def main():
 
     print(f"Found {len(npy_files)} file(s) in {input_dir}")
     print(f"Output directory: {output_dir}")
+    print(f"Subsample: {args.subsample}, Max frames: {args.max_frames}")
 
     # Load robot once.
     urdf = load_robot_description("g1_description")
     robot = pk.Robot.from_urdf(urdf)
+    robot_coll = pk.collision.RobotCollision.from_urdf(urdf)
 
     lafan_joint_retarget_indices, g1_joint_retarget_indices = get_lafan_retarget_indices()
     lafan_mask = create_conn_tree(robot, g1_joint_retarget_indices)
@@ -268,6 +316,7 @@ def main():
     weights: RetargetingWeights = {
         "local_alignment": 2.0,
         "global_alignment": 1.0,
+        "root_smoothness": 1.0,
     }
 
     for i, npy_path in enumerate(npy_files):
@@ -277,6 +326,7 @@ def main():
             npy_path=npy_path,
             output_path=output_path,
             robot=robot,
+            robot_coll=robot_coll,
             lafan_joint_retarget_indices=lafan_joint_retarget_indices,
             g1_joint_retarget_indices=g1_joint_retarget_indices,
             lafan_mask=lafan_mask,

@@ -171,6 +171,58 @@ def get_humanoid_retarget_indices() -> tuple[jnp.ndarray, jnp.ndarray]:
     return smpl_joint_retarget_indices, g1_joint_retarget_indices
 
 
+LAFAN_JOINT_NAMES = [
+    "Hips",          # 0
+    "RightUpLeg",    # 1
+    "RightLeg",      # 2
+    "RightFoot",     # 3
+    "RightToeBase",  # 4
+    "LeftUpLeg",     # 5
+    "LeftLeg",       # 6
+    "LeftFoot",      # 7
+    "LeftToeBase",   # 8
+    "Spine",         # 9
+    "Spine1",        # 10
+    "Spine2",        # 11
+    "Neck",          # 12
+    "Head",          # 13
+    "RightShoulder", # 14
+    "RightArm",      # 15
+    "RightForeArm",  # 16
+    "RightHand",     # 17
+    "LeftShoulder",  # 18
+    "LeftArm",       # 19
+    "LeftForeArm",   # 20
+    "LeftHand",      # 21
+]
+
+
+def get_lafan_retarget_indices() -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Get the mapping indices between LaFAN (22 joints) and G1 humanoid links."""
+    lafan_joint_retarget_indices = []
+    g1_joint_retarget_indices = []
+
+    for lafan_name, g1_name in [
+        ("Hips",         "pelvis_contour_link"),
+        ("LeftUpLeg",    "left_hip_pitch_link"),
+        ("RightUpLeg",   "right_hip_pitch_link"),
+        ("LeftLeg",      "left_knee_link"),
+        ("RightLeg",     "right_knee_link"),
+        ("LeftFoot",     "left_ankle_roll_link"),
+        ("RightFoot",    "right_ankle_roll_link"),
+        ("LeftArm",      "left_shoulder_roll_link"),
+        ("RightArm",     "right_shoulder_roll_link"),
+        ("LeftForeArm",  "left_elbow_link"),
+        ("RightForeArm", "right_elbow_link"),
+        ("LeftHand",     "left_wrist_roll_link"),
+        ("RightHand",    "right_wrist_roll_link"),
+    ]:
+        lafan_joint_retarget_indices.append(LAFAN_JOINT_NAMES.index(lafan_name))
+        g1_joint_retarget_indices.append(G1_LINK_NAMES.index(g1_name))
+
+    return jnp.array(lafan_joint_retarget_indices), jnp.array(g1_joint_retarget_indices)
+
+
 MANO_TO_SHADOW_MAPPING = {
     # Wrist
     0: "palm",

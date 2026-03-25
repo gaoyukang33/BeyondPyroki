@@ -1,10 +1,13 @@
-"""LaFAN Humanoid Retargeting
+"""LaFAN Batch Humanoid Retargeting
 
-Retarget LaFAN motion capture data (22 joints, Y-up) to the G1 humanoid robot.
-Based on 10_humanoid_retargeting.py, adapted for the LaFAN joint format.
+Retarget all LaFAN .npy files in an input directory to the G1 humanoid robot,
+and save results to an output directory with corresponding filenames.
+
+Usage:
+    python lafan_humanoid_retargeting.py --input_dir /path/to/lafan --output_dir /path/to/output
 """
 
-import time
+import argparse
 from pathlib import Path
 from typing import Tuple, TypedDict
 
@@ -15,9 +18,7 @@ import jaxlie
 import jaxls
 import numpy as onp
 import pyroki as pk
-import viser
 from robot_descriptions.loaders.yourdfpy import load_robot_description
-from viser.extras import ViserUrdf
 
 from retarget_helpers._utils import (
     LAFAN_JOINT_NAMES,
@@ -26,109 +27,15 @@ from retarget_helpers._utils import (
 )
 
 
-# LaFAN data uses Y-up; pyroki uses Z-up.
 def transform_y_up_to_z_up(joints: onp.ndarray) -> onp.ndarray:
-    """Convert Y-up coordinates to Z-up: [x, y, z] -> [x, z, y].
-
-    Y-up: X=right, Y=up, Z=forward
-    Z-up: X=right, Y=forward, Z=up
-    """
+    """Convert Y-up coordinates to Z-up: [x, y, z] -> [x, z, y]."""
     transform_matrix = onp.array([[1, 0, 0], [0, 0, 1], [0, 1, 0]])
     return joints @ transform_matrix.T
 
 
 class RetargetingWeights(TypedDict):
     local_alignment: float
-    """Local alignment weight, by matching the relative joint/keypoint positions and angles."""
     global_alignment: float
-    """Global alignment weight, by matching the keypoint positions to the robot."""
-
-
-def main():
-    """Main function for LaFAN humanoid retargeting."""
-
-    urdf = load_robot_description("g1_description")
-    robot = pk.Robot.from_urdf(urdf)
-
-    # Load LaFAN motion data: [N, 22, 3] in Y-up coordinate system.
-    lafan_path = Path(
-        "/Users/yukanggao/Desktop/code_for_nips/holosoma/src/holosoma_retargeting"
-        "/holosoma_retargeting/demo_data/lafan/aiming1_subject1.npy"
-    )
-    lafan_keypoints = onp.load(str(lafan_path))  # (7184, 22, 3)
-    assert lafan_keypoints.shape[1:] == (22, 3), (
-        f"Expected (N, 22, 3), got {lafan_keypoints.shape}"
-    )
-
-    # Convert Y-up to Z-up.
-    lafan_keypoints = transform_y_up_to_z_up(lafan_keypoints)
-
-    # Subsample to make optimization tractable.
-    # Use every 4th frame (~7.5 FPS from 30 FPS), and limit to first 500 frames.
-    max_frames = 500
-    subsample = 4
-    lafan_keypoints = lafan_keypoints[::subsample][:max_frames]
-
-    num_timesteps = lafan_keypoints.shape[0]
-    num_joints = lafan_keypoints.shape[1]
-    print(f"Retargeting {num_timesteps} frames, {num_joints} joints")
-
-    lafan_joint_retarget_indices, g1_joint_retarget_indices = (
-        get_lafan_retarget_indices()
-    )
-    lafan_mask = create_conn_tree(robot, g1_joint_retarget_indices)
-
-    server = viser.ViserServer()
-    base_frame = server.scene.add_frame("/base", show_axes=False)
-    urdf_vis = ViserUrdf(server, urdf, root_node_name="/base")
-    playing = server.gui.add_checkbox("playing", True)
-    timestep_slider = server.gui.add_slider("timestep", 0, num_timesteps - 1, 1, 0)
-
-    weights = pk.viewer.WeightTuner(
-        server,
-        RetargetingWeights(  # type: ignore
-            local_alignment=2.0,
-            global_alignment=1.0,
-        ),
-    )
-
-    Ts_world_root, joints = None, None
-
-    def generate_trajectory():
-        nonlocal Ts_world_root, joints
-        gen_button.disabled = True
-        Ts_world_root, joints = solve_retargeting(
-            robot=robot,
-            target_keypoints=lafan_keypoints,
-            source_joint_retarget_indices=lafan_joint_retarget_indices,
-            g1_joint_retarget_indices=g1_joint_retarget_indices,
-            source_mask=lafan_mask,
-            weights=weights.get_weights(),  # type: ignore
-        )
-        gen_button.disabled = False
-
-    gen_button = server.gui.add_button("Retarget!")
-    gen_button.on_click(lambda _: generate_trajectory())
-
-    generate_trajectory()
-    assert Ts_world_root is not None and joints is not None
-
-    while True:
-        with server.atomic():
-            if playing.value:
-                timestep_slider.value = (timestep_slider.value + 1) % num_timesteps
-            tstep = timestep_slider.value
-            base_frame.wxyz = onp.array(Ts_world_root.wxyz_xyz[tstep][:4])
-            base_frame.position = onp.array(Ts_world_root.wxyz_xyz[tstep][4:])
-            urdf_vis.update_cfg(onp.array(joints[tstep]))
-            server.scene.add_point_cloud(
-                "/target_keypoints",
-                onp.array(lafan_keypoints[tstep]),
-                onp.array((0, 0, 255))[None].repeat(num_joints, axis=0),
-                point_size=0.01,
-            )
-
-        time.sleep(0.05)
 
 
 @jdc.jit
@@ -145,7 +52,6 @@ def solve_retargeting(
     n_retarget = len(source_joint_retarget_indices)
     timesteps = target_keypoints.shape[0]
 
-    # Joints that should move less for natural humanoid motion.
     joints_to_move_less = jnp.array(
         [
             robot.joints.actuated_names.index(name)
@@ -153,7 +59,6 @@ def solve_retargeting(
         ]
     )
 
-    # Variables.
     class SourceJointsScaleVar(
         jaxls.Var[jax.Array], default_factory=lambda: jnp.ones((n_retarget, n_retarget))
     ): ...
@@ -165,7 +70,6 @@ def solve_retargeting(
     var_source_joints_scale = SourceJointsScaleVar(jnp.zeros(timesteps))
     var_offset = OffsetVar(jnp.zeros(timesteps))
 
-    # Costs and constraints.
     @jaxls.Cost.factory
     def retargeting_cost(
         var_values: jaxls.VarValues,
@@ -174,7 +78,6 @@ def solve_retargeting(
         var_source_joints_scale: SourceJointsScaleVar,
         keypoints: jnp.ndarray,
     ) -> jax.Array:
-        """Match relative joint positions and angles between source and robot."""
         robot_cfg = var_values[var_robot_cfg]
         T_root_link = jaxlie.SE3(robot.forward_kinematics(cfg=robot_cfg))
         T_world_root = var_values[var_Ts_world_root]
@@ -183,11 +86,9 @@ def solve_retargeting(
         source_pos = keypoints[jnp.array(source_joint_retarget_indices)]
         robot_pos = T_world_link.translation()[jnp.array(g1_joint_retarget_indices)]
 
-        # NxN grid of relative positions.
         delta_source = source_pos[:, None] - source_pos[None, :]
         delta_robot = robot_pos[:, None] - robot_pos[None, :]
 
-        # Vector regularization.
         position_scale = var_values[var_source_joints_scale][..., None]
         residual_position_delta = (
             (delta_source - delta_robot * position_scale)
@@ -195,7 +96,6 @@ def solve_retargeting(
             * source_mask[..., None]
         )
 
-        # Vector angle regularization.
         delta_source_normalized = delta_source / jnp.linalg.norm(
             delta_source + 1e-6, axis=-1, keepdims=True
         )
@@ -211,13 +111,12 @@ def solve_retargeting(
             * source_mask
         )
 
-        residual = (
+        return (
             jnp.concatenate(
                 [residual_position_delta.flatten(), residual_angle_delta.flatten()]
             )
             * weights["local_alignment"]
         )
-        return residual
 
     @jaxls.Cost.factory
     def pc_alignment_cost(
@@ -226,7 +125,6 @@ def solve_retargeting(
         var_robot_cfg: jaxls.Var[jnp.ndarray],
         keypoints: jnp.ndarray,
     ) -> jax.Array:
-        """Soft cost to align the human keypoints to the robot, in the world frame."""
         T_world_root = var_values[var_Ts_world_root]
         robot_cfg = var_values[var_robot_cfg]
         T_root_link = jaxlie.SE3(robot.forward_kinematics(cfg=robot_cfg))
@@ -259,14 +157,11 @@ def solve_retargeting(
             var_joints,
             target_keypoints,
         ),
-    ]
-
-    costs.append(
         pk.costs.limit_constraint(
             jax.tree.map(lambda x: x[None], robot),
             var_joints,
         ),
-    )
+    ]
 
     solution = (
         jaxls.LeastSquaresProblem(
@@ -285,6 +180,112 @@ def solve_retargeting(
     offset = solution[var_offset]
     transform = jaxlie.SE3.from_translation(offset) @ transform
     return transform, solution[var_joints]
+
+
+def retarget_single_file(
+    npy_path: Path,
+    output_path: Path,
+    robot: pk.Robot,
+    lafan_joint_retarget_indices: jnp.ndarray,
+    g1_joint_retarget_indices: jnp.ndarray,
+    lafan_mask: jnp.ndarray,
+    weights: RetargetingWeights,
+    max_frames: int,
+    subsample: int,
+):
+    """Retarget a single LaFAN .npy file and save results."""
+    lafan_keypoints = onp.load(str(npy_path))
+    assert lafan_keypoints.shape[1:] == (22, 3), (
+        f"{npy_path.name}: expected (N, 22, 3), got {lafan_keypoints.shape}"
+    )
+
+    # Coordinate transform and subsampling.
+    lafan_keypoints = transform_y_up_to_z_up(lafan_keypoints)
+    if subsample > 1:
+        lafan_keypoints = lafan_keypoints[::subsample]
+    if max_frames > 0:
+        lafan_keypoints = lafan_keypoints[:max_frames]
+
+    num_timesteps = lafan_keypoints.shape[0]
+    print(f"  Solving {num_timesteps} frames ...")
+
+    Ts_world_root, joints = solve_retargeting(
+        robot=robot,
+        target_keypoints=lafan_keypoints,
+        source_joint_retarget_indices=lafan_joint_retarget_indices,
+        g1_joint_retarget_indices=g1_joint_retarget_indices,
+        source_mask=lafan_mask,
+        weights=weights,
+    )
+
+    # Save: joints (N, n_dof) and transforms (N, 7) as a dict.
+    result = {
+        "joints": onp.array(joints),                    # (N, n_dof)
+        "transforms": onp.array(Ts_world_root.wxyz_xyz),  # (N, 7) wxyz_xyz
+    }
+    onp.savez(str(output_path), **result)
+    print(f"  Saved -> {output_path}  (joints: {result['joints'].shape}, transforms: {result['transforms'].shape})")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Batch LaFAN → G1 retargeting")
+    parser.add_argument(
+        "--input_dir",
+        type=str,
+        default="/Users/yukanggao/Desktop/code_for_nips/holosoma/src/holosoma_retargeting"
+                "/holosoma_retargeting/demo_data/lafan",
+        help="Directory containing LaFAN .npy files",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="/Users/yukanggao/Desktop/code_for_nips/pyroki/examples/retarget_output",
+        help="Directory to save retargeted results",
+    )
+    parser.add_argument("--max_frames", type=int, default=0, help="Max frames per file (0 = all)")
+    parser.add_argument("--subsample", type=int, default=1, help="Take every N-th frame")
+    args = parser.parse_args()
+
+    input_dir = Path(args.input_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    npy_files = sorted(input_dir.glob("*.npy"))
+    if not npy_files:
+        print(f"No .npy files found in {input_dir}")
+        return
+
+    print(f"Found {len(npy_files)} file(s) in {input_dir}")
+    print(f"Output directory: {output_dir}")
+
+    # Load robot once.
+    urdf = load_robot_description("g1_description")
+    robot = pk.Robot.from_urdf(urdf)
+
+    lafan_joint_retarget_indices, g1_joint_retarget_indices = get_lafan_retarget_indices()
+    lafan_mask = create_conn_tree(robot, g1_joint_retarget_indices)
+
+    weights: RetargetingWeights = {
+        "local_alignment": 2.0,
+        "global_alignment": 1.0,
+    }
+
+    for i, npy_path in enumerate(npy_files):
+        print(f"\n[{i + 1}/{len(npy_files)}] Processing: {npy_path.name}")
+        output_path = output_dir / f"{npy_path.stem}.npz"
+        retarget_single_file(
+            npy_path=npy_path,
+            output_path=output_path,
+            robot=robot,
+            lafan_joint_retarget_indices=lafan_joint_retarget_indices,
+            g1_joint_retarget_indices=g1_joint_retarget_indices,
+            lafan_mask=lafan_mask,
+            weights=weights,
+            max_frames=args.max_frames,
+            subsample=args.subsample,
+        )
+
+    print(f"\nDone! All results saved to {output_dir}")
 
 
 if __name__ == "__main__":
